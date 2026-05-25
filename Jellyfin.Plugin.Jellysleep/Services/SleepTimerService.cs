@@ -79,7 +79,7 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
         }
 
         // for testing purposes, set the timer to 15 seconds
-        // endTime = startTime.AddSeconds(15); // TODO: remove
+         endTime = startTime.AddSeconds(15); // TODO: remove
 
         var timer = new ActiveSleepTimer
         {
