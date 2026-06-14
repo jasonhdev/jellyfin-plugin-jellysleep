@@ -75,4 +75,10 @@ public interface ISleepTimerService
     /// </summary>
     /// <returns>A list of all active sleep timers.</returns>
     Task<List<ActiveSleepTimer>> ListAllActiveTimersAsync();
+
+    /// <summary>Marks a device as needing a pause on its next segment request.</summary>
+    void SetPendingPause(string deviceId);
+
+    /// <summary>Checks and clears the pending pause flag for a device.</summary>
+    bool ConsumePendingPause(string deviceId);
 }

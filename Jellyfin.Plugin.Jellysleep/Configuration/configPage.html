@@ -31,6 +31,67 @@
               </div>
               <hr />
               <br />
+
+              <!-- AUTO TIMER SECTION -->
+              <div class="verticalSection">
+                <h2 class="sectionTitle">Auto Sleep Timer</h2>
+                <p style="opacity: 0.7; margin-bottom: 1em;">
+                  Automatically start a sleep timer whenever playback begins on a matched device.
+                  The timer runs entirely on the server — the device can sleep and it will still fire.
+                </p>
+
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                  <label class="emby-checkbox-label">
+                    <input id="autoTimerEnabled" type="checkbox" is="emby-checkbox" />
+                    <span>Enable auto sleep timer on playback start</span>
+                  </label>
+                </div>
+
+                <div class="inputContainer" style="margin-top: 1em;">
+                  <label class="inputLabel inputLabelUnfocused" for="autoTimerType">Timer Type</label>
+                  <select id="autoTimerType" is="emby-select" class="emby-select-withcolor emby-select">
+                    <option value="duration">Duration (stop after X minutes)</option>
+                    <option value="episode">Episode (stop after X episodes)</option>
+                  </select>
+                </div>
+
+                <div id="durationFields">
+                  <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="autoTimerDurationMinutes">Duration (minutes)</label>
+                    <input id="autoTimerDurationMinutes" type="number" min="1" is="emby-input" class="emby-input" />
+                  </div>
+                </div>
+
+                <div id="episodeFields" style="display: none;">
+                  <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="autoTimerEpisodeCount">
+                      Episode Count (leave blank to stop after current episode)
+                    </label>
+                    <input id="autoTimerEpisodeCount" type="number" min="1" is="emby-input" class="emby-input" />
+                  </div>
+                </div>
+
+                <div class="inputContainer">
+                  <label class="inputLabel inputLabelUnfocused" for="autoTimerDeviceIds">
+                    Restrict to Device IDs (comma-separated, leave blank for all devices)
+                  </label>
+                  <input id="autoTimerDeviceIds" type="text" is="emby-input" class="emby-input" />
+                  <div class="fieldDescription">
+                    Find device IDs in Dashboard &rarr; Devices. Example: <code>abc123,def456</code>
+                  </div>
+                </div>
+
+                <div>
+                  <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                    <span>Save</span>
+                  </button>
+                </div>
+              </div>
+              <!-- END AUTO TIMER SECTION -->
+
+              <br />
+              <hr />
+
               <div style="margin-top: 2em">
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1em">
                   <h2 class="sectionTitle">Active Sleep Timers</h2>
@@ -142,7 +203,6 @@
 
             var deviceInfo = await response.json();
 
-            // Build device display name like Jellyfin does
             var parts = [];
             if (deviceInfo.AppName) {
               parts.push(deviceInfo.AppName);
@@ -186,7 +246,6 @@
             return;
           }
 
-          // Fetch all user names and device info
           var userNames = {};
           var deviceInfoCache = {};
 
@@ -200,23 +259,18 @@
             }
           }
 
-          // Clear container
           container.innerHTML = '';
 
-          // Get template
           var template = document.getElementById('timer-card-template');
 
           for (var i = 0; i < timers.length; i++) {
             var timer = timers[i];
             var userName = userNames[timer.UserId];
 
-            // Clone template
             var clone = document.importNode(template.content, true);
 
-            // Set user name
             clone.querySelector('.timer-user-name').textContent = userName;
 
-            // Set type badge
             var badge = clone.querySelector('.timer-type-badge');
             badge.textContent = getTimerTypeLabel(timer.Type);
             if (timer.Type === 'duration') {
@@ -227,7 +281,6 @@
               badge.style.color = '#9b59b6';
             }
 
-            // Build details HTML
             var detailsHtml = '';
 
             if (timer.DeviceId) {
@@ -300,10 +353,7 @@
               }
             }
 
-            // Set details
             clone.querySelector('.timer-details').innerHTML = detailsHtml;
-
-            // Append to container
             container.appendChild(clone);
           }
         }
@@ -317,28 +367,50 @@
           return Math.ceil(diff / 60000);
         }
 
+        // Show/hide duration vs episode fields based on selected type
+        document.getElementById('autoTimerType').addEventListener('change', function () {
+          var type = this.value;
+          document.getElementById('durationFields').style.display = type === 'duration' ? '' : 'none';
+          document.getElementById('episodeFields').style.display = type === 'episode' ? '' : 'none';
+        });
+
         document.querySelector('#JellysleepConfigPage').addEventListener('pageshow', function () {
           Dashboard.showLoadingMsg();
           ApiClient.getPluginConfiguration(JellysleepConfig.pluginUniqueId).then(function (config) {
-            $('#jellysleepEnabled').prop('checked', config.IsEnabled || false);
+            document.getElementById('autoTimerEnabled').checked = config.AutoTimerEnabled || false;
+
+            var type = config.AutoTimerType || 'duration';
+            document.getElementById('autoTimerType').value = type;
+            document.getElementById('durationFields').style.display = type === 'duration' ? '' : 'none';
+            document.getElementById('episodeFields').style.display = type === 'episode' ? '' : 'none';
+
+            document.getElementById('autoTimerDurationMinutes').value = config.AutoTimerDurationMinutes || 60;
+            document.getElementById('autoTimerEpisodeCount').value = config.AutoTimerEpisodeCount || '';
+            document.getElementById('autoTimerDeviceIds').value = config.AutoTimerDeviceIds || '';
+
             Dashboard.hideLoadingMsg();
           });
 
-          // Load active timers
           loadActiveTimers();
         });
 
-        document.querySelector('#JellysleepConfigPage').addEventListener('submit', function (e) {
+        document.querySelector('#JellysleepConfigForm').addEventListener('submit', function (e) {
+          e.preventDefault();
           Dashboard.showLoadingMsg();
           ApiClient.getPluginConfiguration(JellysleepConfig.pluginUniqueId).then(function (config) {
-            var isEnabled = $('#jellysleepEnabled').prop('checked');
-            config.IsEnabled = isEnabled;
+            config.AutoTimerEnabled = document.getElementById('autoTimerEnabled').checked;
+            config.AutoTimerType = document.getElementById('autoTimerType').value;
+            config.AutoTimerDurationMinutes = parseInt(document.getElementById('autoTimerDurationMinutes').value, 10) || 60;
+
+            var episodeCountVal = document.getElementById('autoTimerEpisodeCount').value;
+            config.AutoTimerEpisodeCount = episodeCountVal ? parseInt(episodeCountVal, 10) : null;
+
+            config.AutoTimerDeviceIds = document.getElementById('autoTimerDeviceIds').value || '';
+
             ApiClient.updatePluginConfiguration(JellysleepConfig.pluginUniqueId, config).then(function (result) {
               Dashboard.processPluginConfigurationUpdateResult(result);
             });
           });
-
-          e.preventDefault();
           return false;
         });
 

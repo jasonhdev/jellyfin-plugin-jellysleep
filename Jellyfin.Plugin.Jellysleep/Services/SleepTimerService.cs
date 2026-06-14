@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Jellyfin.Plugin.Jellysleep.Models;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Session;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -17,14 +18,17 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     private readonly ConcurrentDictionary<UserDeviceKey, SemaphoreSlim> _timerLocks;
     private readonly ConcurrentDictionary<UserDeviceKey, CompletionCooldown> _completionCooldowns;
     private readonly Timer _cleanupTimer;
-    private const int CooldownSeconds = 3;
+    private const int CooldownSeconds = 60;
+    private readonly ITranscodeManager _transcodeManager;
+    private readonly ConcurrentDictionary<string, bool> _pendingPauses = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SleepTimerService"/> class.
     /// </summary>
     /// <param name="logger">The logger.</param>
     /// <param name="sessionManager">The session manager.</param>
-    public SleepTimerService(ILogger<SleepTimerService> logger, ISessionManager sessionManager)
+    /// <param name="transcodeManager">The transcode manager.</param>
+    public SleepTimerService(ILogger<SleepTimerService> logger, ISessionManager sessionManager, ITranscodeManager transcodeManager)
     {
         _logger = logger;
         _sessionManager = sessionManager;
@@ -34,7 +38,20 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
 
         // Setup cleanup timer to run every 30 seconds
         _cleanupTimer = new Timer(async _ => await CleanupTimersAsync().ConfigureAwait(false), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+
+        _transcodeManager = transcodeManager;
+
     }
+
+
+    /// <inheritdoc/>
+    public void SetPendingPause(string deviceId) =>
+        _pendingPauses[deviceId] = true;
+
+    /// <inheritdoc/>
+    public bool ConsumePendingPause(string deviceId) =>
+        _pendingPauses.TryRemove(deviceId, out _);
+
 
     /// <summary>
     /// Starts a new sleep timer for the specified user and device.
@@ -78,9 +95,6 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
             endTime = request.EndTime ?? startTime.AddMinutes(request.Duration!.Value);
         }
 
-        // for testing purposes, set the timer to 15 seconds
-        // endTime = startTime.AddSeconds(15); // TODO: remove
-
         var timer = new ActiveSleepTimer
         {
             Id = timerId,
@@ -95,9 +109,6 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
             Label = request.Label,
             IsActive = true
         };
-
-        // Note: We don't store session information in the timer
-        // Sessions will be looked up dynamically when needed
 
         _activeTimers.TryAdd(userDeviceKey, timer);
 
@@ -242,7 +253,7 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
                     timer.Id,
                     CooldownSeconds);
 
-                // Set cooldown to prevent immediate new playback
+                // Set cooldown to prevent immediate re-arm
                 _completionCooldowns[userDeviceKey] = new CompletionCooldown
                 {
                     UserId = userId,
@@ -272,7 +283,7 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
                 timer.Id,
                 CooldownSeconds);
 
-            // Set cooldown to prevent immediate new playback
+            // Set cooldown to prevent immediate re-arm
             _completionCooldowns[userDeviceKey] = new CompletionCooldown
             {
                 UserId = userId,
@@ -386,7 +397,8 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     /// <inheritdoc />
     public async Task CleanupTimersAsync()
     {
-        // Clean up expired cooldowns and check for lingering sessions
+        // Clean up expired cooldowns — just remove them, do NOT re-kill sessions.
+        // The session stays alive intentionally after a Pause command.
         var expiredCooldowns = _completionCooldowns
             .Where(kvp => !kvp.Value.IsActive())
             .Select(kvp => kvp.Key)
@@ -394,19 +406,6 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
 
         foreach (var key in expiredCooldowns)
         {
-            var cooldown = _completionCooldowns[key];
-
-            // Check if there are still active sessions for this user/device after cooldown expires
-            if (IsUserSessionActive(cooldown.UserId, cooldown.DeviceId))
-            {
-                _logger.LogInformation(
-                    "Cooldown expired but user {UserId} on device {DeviceId} still has active session, terminating it",
-                    cooldown.UserId,
-                    cooldown.DeviceId ?? "unknown");
-
-                await StopPlaybackForUserAsync(cooldown.UserId, cooldown.DeviceId).ConfigureAwait(false);
-            }
-
             _completionCooldowns.TryRemove(key, out _);
         }
 
@@ -443,13 +442,20 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
             if (timer.Type == "duration" && timer.IsExpired())
             {
                 _logger.LogInformation(
-                    "Duration-based timer {TimerId} expired for user {UserId} on device {DeviceId}, stopping playback",
+                    "Duration-based timer {TimerId} expired for user {UserId} on device {DeviceId}, pausing playback",
                     timer.Id,
                     timer.UserId,
                     userDeviceKey.DeviceId);
 
-                // Stop playback for this user/device combination
-                await StopPlaybackForUserAsync(timer.UserId, timer.DeviceId).ConfigureAwait(false);
+                // Set cooldown to prevent auto-timer from re-arming immediately
+                _completionCooldowns[userDeviceKey] = new CompletionCooldown
+                {
+                    UserId = timer.UserId,
+                    DeviceId = timer.DeviceId,
+                    ExpiresAt = DateTime.UtcNow.AddSeconds(CooldownSeconds)
+                };
+
+                await PausePlaybackForUserAsync(timer.UserId, timer.DeviceId).ConfigureAwait(false);
             }
 
             // Remove the timer and its lock
@@ -500,7 +506,60 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     }
 
     /// <summary>
-    /// Stop playback for a specific user and device combination.
+    /// Pause playback for a specific user and device combination.
+    /// </summary>
+    /// <param name="userId">The user ID.</param>
+    /// <param name="deviceId">The device ID (optional).</param>
+    /// <returns>A task representing the async operation.</returns>
+    private async Task PausePlaybackForUserAsync(Guid userId, string? deviceId)
+    {
+        try
+        {
+            var sessions = _sessionManager.Sessions
+                .Where(s => s.UserId == userId &&
+                           (string.IsNullOrEmpty(deviceId) || s.DeviceId == deviceId) &&
+                           s.NowPlayingItem != null)
+                .ToList();
+
+            _logger.LogInformation(
+                "Found {SessionCount} active sessions for user {UserId} on device {DeviceId}",
+                sessions.Count, userId, deviceId ?? "any");
+
+            foreach (var session in sessions)
+            {
+                _logger.LogInformation(
+                    "Setting pending pause for device {DeviceId} — will intercept next HLS segment request",
+                    session.DeviceId);
+
+                // Flag this device — the middleware will 503 its next segment request
+                if (!string.IsNullOrEmpty(session.DeviceId))
+                    SetPendingPause(session.DeviceId);
+
+                // Also try WebSocket pause in case the socket is alive
+                try
+                {
+                    await _sessionManager.SendPlaystateCommand(
+                        null,
+                        session.Id,
+                        new MediaBrowser.Model.Session.PlaystateRequest
+                        {
+                            Command = MediaBrowser.Model.Session.PlaystateCommand.Pause
+                        },
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "WebSocket pause failed for session {SessionId} (expected if socket is stale)", session.Id);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error pausing playback for user {UserId} on device {DeviceId}", userId, deviceId);
+        }
+    }
+    /// <summary>
+    /// Stop playback for a specific user and device combination (used for episode timers).
     /// </summary>
     /// <param name="userId">The user ID.</param>
     /// <param name="deviceId">The device ID (optional).</param>
@@ -509,7 +568,6 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
     {
         try
         {
-            // Dynamically find sessions based on userId and deviceId
             var sessions = _sessionManager.Sessions
                 .Where(s => s.UserId == userId &&
                            (string.IsNullOrEmpty(deviceId) || s.DeviceId == deviceId))
@@ -529,15 +587,16 @@ public class SleepTimerService : BackgroundService, ISleepTimerService
                     session.Id,
                     session.DeviceId ?? "unknown");
 
+                // Pass null as the controlling session so Jellyfin treats this
+                // as a server-originated command rather than a self-control request.
                 await _sessionManager.SendPlaystateCommand(
-                    session.Id,
+                    null,
                     session.Id,
                     new MediaBrowser.Model.Session.PlaystateRequest
                     {
                         Command = MediaBrowser.Model.Session.PlaystateCommand.Stop
                     },
                     CancellationToken.None).ConfigureAwait(false);
-
             }
         }
         catch (Exception ex)

@@ -5,6 +5,8 @@ using MediaBrowser.Controller.Events;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.AspNetCore.Hosting;
+using Jellyfin.Plugin.Jellysleep.Middleware;
 
 namespace Jellyfin.Plugin.Jellysleep;
 
@@ -24,5 +26,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         // Register event handlers
         serviceCollection.AddScoped<IEventConsumer<PlaybackStopEventArgs>, PlaybackStopConsumer>();
         serviceCollection.AddScoped<IEventConsumer<PlaybackStartEventArgs>, PlaybackStartConsumer>();
+        serviceCollection.AddScoped<IEventConsumer<PlaybackProgressEventArgs>, PlaybackProgressConsumer>();
+        // Add inside RegisterServices:
+        serviceCollection.AddSingleton<IStartupFilter, SleepTimerStartupFilter>();
     }
 }

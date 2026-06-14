@@ -7,7 +7,8 @@ using Microsoft.Extensions.Logging;
 namespace Jellyfin.Plugin.Jellysleep.EventHandlers;
 
 /// <summary>
-/// Handles playback start events to prevent new playback when episode timer is active.
+/// Handles playback start events to prevent new playback when episode timer is active,
+/// and auto-starts a sleep timer when configured to do so.
 /// </summary>
 public class PlaybackStartConsumer : IEventConsumer<PlaybackStartEventArgs>
 {
@@ -54,9 +55,9 @@ public class PlaybackStartConsumer : IEventConsumer<PlaybackStartEventArgs>
                     session.UserId,
                     eventArgs.Item?.Name ?? "Unknown");
 
-                // Stop this playback immediately
+                // Pass null as controlling session — server-originated command
                 await _sessionManager.SendPlaystateCommand(
-                    session.Id,
+                    null,
                     session.Id,
                     new MediaBrowser.Model.Session.PlaystateRequest
                     {
@@ -74,57 +75,77 @@ public class PlaybackStartConsumer : IEventConsumer<PlaybackStartEventArgs>
                     session.DeviceId);
             }
 
-            // check if there is an active sleep timer for this user and device
+            // Check if there is an active sleep timer for this user and device
             var timerStatus = await _sleepTimerService.GetTimerStatusAsync(session.UserId, session.DeviceId).ConfigureAwait(false);
-            if (timerStatus == null || !timerStatus.IsActive)
-            {
-                _logger.LogDebug("No active sleep timer for user {UserId} on device {DeviceId}.", session.UserId, session.DeviceId);
-                return;
-            }
 
-            _logger.LogInformation(
-                "Playback started for user {UserId} in session {SessionId}, item: {ItemName}",
-                session.UserId,
-                session.Id,
-                eventArgs.Item?.Name ?? "Unknown");
-
-            if (timerStatus.Type == "episode" && timerStatus.EpisodeCount >= 1)
+            if (timerStatus != null && timerStatus.IsActive)
             {
-                // For multi-episode timers, check if we've already reached the target
-                // The episode count is incremented in PlaybackStopConsumer, so if we're at or over
-                // the target when a new episode starts, we should stop it immediately
-                if (timerStatus.EpisodesPlayed >= timerStatus.EpisodeCount)
+                _logger.LogInformation(
+                    "Playback started for user {UserId} in session {SessionId}, item: {ItemName}",
+                    session.UserId,
+                    session.Id,
+                    eventArgs.Item?.Name ?? "Unknown");
+
+                if (timerStatus.Type == "episode" && timerStatus.EpisodeCount >= 1)
                 {
+                    if (timerStatus.EpisodesPlayed >= timerStatus.EpisodeCount)
+                    {
+                        _logger.LogInformation(
+                            "Stopping playback in session {SessionId} for user {UserId} - episode timer target already reached. Episodes: {EpisodesPlayed}/{EpisodeCount}, Item: {ItemName}",
+                            session.Id,
+                            session.UserId,
+                            timerStatus.EpisodesPlayed,
+                            timerStatus.EpisodeCount,
+                            eventArgs.Item?.Name ?? "Unknown");
+
+                        // Pass null as controlling session — server-originated command
+                        await _sessionManager.SendPlaystateCommand(
+                            null,
+                            session.Id,
+                            new MediaBrowser.Model.Session.PlaystateRequest
+                            {
+                                Command = MediaBrowser.Model.Session.PlaystateCommand.Stop
+                            },
+                            CancellationToken.None).ConfigureAwait(false);
+
+                        await _sleepTimerService.HandlePlaybackStopAsync(session.UserId, session.Id).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "Allowing new playback in session {SessionId} for user {UserId} - episode timer still has episodes remaining. Episodes: {EpisodesPlayed}/{EpisodeCount}, Item: {ItemName}",
+                            session.Id,
+                            session.UserId,
+                            timerStatus.EpisodesPlayed,
+                            timerStatus.EpisodeCount,
+                            eventArgs.Item?.Name ?? "Unknown");
+                    }
+                }
+            }
+            else
+            {
+                // No active timer — check if we should auto-start one
+                if (ShouldAutoStart(session.DeviceId))
+                {
+                    var config = JellysleepPlugin.Instance!.Configuration;
+                    var request = new Models.SleepTimerRequest
+                    {
+                        Type = config.AutoTimerType,
+                        Duration = config.AutoTimerType == "duration" ? config.AutoTimerDurationMinutes : null,
+                        EpisodeCount = config.AutoTimerType == "episode" ? config.AutoTimerEpisodeCount : null,
+                        Label = "Auto"
+                    };
+
+                    await _sleepTimerService.StartTimerAsync(session.UserId, session.DeviceId, request)
+                        .ConfigureAwait(false);
+
                     _logger.LogInformation(
-                        "Stopping playback in session {SessionId} for user {UserId} - episode timer target already reached. Episodes: {EpisodesPlayed}/{EpisodeCount}, Item: {ItemName}",
-                        session.Id,
-                        session.UserId,
-                        timerStatus.EpisodesPlayed,
-                        timerStatus.EpisodeCount,
-                        eventArgs.Item?.Name ?? "Unknown");
-
-                    // Stop this playback immediately
-                    await _sessionManager.SendPlaystateCommand(
-                        session.Id,
-                        session.Id,
-                        new MediaBrowser.Model.Session.PlaystateRequest
-                        {
-                            Command = MediaBrowser.Model.Session.PlaystateCommand.Stop
-                        },
-                        CancellationToken.None).ConfigureAwait(false);
-
-                    // Complete the timer
-                    await _sleepTimerService.HandlePlaybackStopAsync(session.UserId, session.Id).ConfigureAwait(false);
+                        "Auto-started {Type} sleep timer on playback start for user {UserId} on device {DeviceId}",
+                        config.AutoTimerType, session.UserId, session.DeviceId);
                 }
                 else
                 {
-                    _logger.LogDebug(
-                        "Allowing new playback in session {SessionId} for user {UserId} - episode timer still has episodes remaining. Episodes: {EpisodesPlayed}/{EpisodeCount}, Item: {ItemName}",
-                        session.Id,
-                        session.UserId,
-                        timerStatus.EpisodesPlayed,
-                        timerStatus.EpisodeCount,
-                        eventArgs.Item?.Name ?? "Unknown");
+                    _logger.LogDebug("No active sleep timer for user {UserId} on device {DeviceId}.", session.UserId, session.DeviceId);
                 }
             }
         }
@@ -132,5 +153,23 @@ public class PlaybackStartConsumer : IEventConsumer<PlaybackStartEventArgs>
         {
             _logger.LogError(ex, "Error handling playback started event");
         }
+    }
+
+    /// <summary>
+    /// Determines whether an auto sleep timer should be started for the given device,
+    /// based on the plugin configuration.
+    /// </summary>
+    /// <param name="deviceId">The device ID to check.</param>
+    /// <returns><c>true</c> if an auto timer should be started; otherwise <c>false</c>.</returns>
+    private static bool ShouldAutoStart(string? deviceId)
+    {
+        var config = JellysleepPlugin.Instance?.Configuration;
+        if (config == null || !config.AutoTimerEnabled) return false;
+
+        if (string.IsNullOrWhiteSpace(config.AutoTimerDeviceIds)) return true;
+
+        var allowed = config.AutoTimerDeviceIds
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return allowed.Contains(deviceId, StringComparer.OrdinalIgnoreCase);
     }
 }
